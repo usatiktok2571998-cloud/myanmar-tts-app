@@ -2,9 +2,8 @@ import os
 import re
 import time
 import tempfile
-import shutil
+import asyncio
 import flet as ft
-import flet_audio as fta
 import edge_tts
 
 # =========================================================
@@ -178,24 +177,10 @@ async def main(page: ft.Page):
     current_mp3_path = None
     current_srt_path = None
     is_playing = False
-    is_paused = False
-    playback_completed = False
 
-    # Audio is a non-visual Flet service. Register it in page.services,
-    # never in page.overlay, so it cannot add a giant blank rectangle to UI.
+    # Flet 0.25.2 requires Audio to have a source when it is created.
+    # Create the Audio control only after an MP3 file has been generated.
     audio_player = None
-
-    def attach_audio_player(player):
-        page.services.append(player)
-
-    def detach_audio_player(player):
-        if player is None:
-            return
-        try:
-            if player in page.services:
-                page.services.remove(player)
-        except (ValueError, AttributeError):
-            pass
 
     header_banner = ft.Container(
         gradient=ft.LinearGradient(
@@ -356,17 +341,6 @@ async def main(page: ft.Page):
         char_count_text.value = f"{len(txt)} chars • {sentences} ။"
         page.update()
 
-    output_name_input = ft.TextField(
-        label="ဖိုင်အမည် (MP3 / SRT)",
-        hint_text="ဥပမာ - my_movie_voice",
-        value="myanmar_tts",
-        prefix_icon=ft.icons.DRIVE_FILE_RENAME_OUTLINED,
-        border_color=BORDER_COLOR,
-        focused_border_color=ACCENT_PURPLE,
-        border_radius=12,
-        text_size=14,
-    )
-
     script_input = ft.TextField(
         hint_text="အသံထုတ်လိုသော မြန်မာစာသားကို ဒီနေရာမှာ ရိုက်ထည့်ပါ...",
         hint_style=ft.TextStyle(color="#475569", size=13),
@@ -428,7 +402,6 @@ async def main(page: ft.Page):
                         ),
                     ],
                 ),
-                output_name_input,
                 script_input,
                 ft.Row(
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -460,93 +433,29 @@ async def main(page: ft.Page):
 
     result_info = ft.Text("No audio generated yet", size=12, color=TEXT_MUTED)
 
-    async def toggle_play(e):
-        nonlocal is_playing, is_paused, playback_completed
+    def toggle_play(e):
+        nonlocal is_playing
         if not current_mp3_path or audio_player is None:
             return
-        try:
-            if is_playing:
-                await audio_player.pause()
-                is_playing = False
-                is_paused = True
-                play_btn.icon = ft.icons.PLAY_CIRCLE_FILL_ROUNDED
-            elif is_paused and not playback_completed:
-                await audio_player.resume()
-                is_playing = True
-                is_paused = False
-                play_btn.icon = ft.icons.PAUSE_CIRCLE_FILLED_ROUNDED
-            else:
-                # Play from position zero after completion so long files can
-                # be replayed, using the native player's actual state event.
-                await audio_player.play(position=0)
-                is_playing = True
-                is_paused = False
-                playback_completed = False
-                play_btn.icon = ft.icons.PAUSE_CIRCLE_FILLED_ROUNDED
-        except Exception as ex:
-            status_label.value = f"❌ Audio Error: {str(ex)[:100]}"
-            status_label.color = "#EF4444"
+        if not is_playing:
+            audio_player.play()
+            play_btn.icon = ft.icons.PAUSE_CIRCLE_FILLED_ROUNDED
+            is_playing = True
+        else:
+            audio_player.pause()
+            play_btn.icon = ft.icons.PLAY_CIRCLE_FILL_ROUNDED
+            is_playing = False
         page.update()
 
     play_btn.on_click = toggle_play
 
-    async def save_output_file(path, label, extension):
-        """Rename/copy the generated file into Android Downloads when possible."""
-        nonlocal current_mp3_path, current_srt_path
-        if not path or not os.path.isfile(path):
-            status_label.value = f"⚠️ {label} ဖိုင် မတွေ့ပါ။ အရင်ထုတ်ပေးပါ။"
-            status_label.color = "#F59E0B"
-            page.update()
-            return
+    def share_mp3(e):
+        if current_mp3_path and os.path.exists(current_mp3_path):
+            page.share_files([current_mp3_path], text="Myanmar TTS Audio (MP3)")
 
-        try:
-            raw_name = (output_name_input.value or "myanmar_tts").strip()
-            # Keep a safe filename on Android and remove any user-entered extension.
-            safe_name = re.sub(r'[\\/:*?"<>|]+', "_", raw_name).strip(" .")
-            safe_name = re.sub(r"\s+", "_", safe_name) or "myanmar_tts"
-            if safe_name.lower().endswith("." + extension.lower()):
-                safe_name = safe_name[:-(len(extension) + 1)].rstrip(" .") or "myanmar_tts"
-            filename = f"{safe_name}.{extension}"
-            downloads_dir = "/storage/emulated/0/Download"
-            source_abs = os.path.abspath(path)
-            downloads_abs = os.path.abspath(downloads_dir)
-
-            if os.path.isdir(downloads_dir) and os.access(downloads_dir, os.W_OK):
-                destination = os.path.join(downloads_dir, filename)
-                if source_abs != os.path.abspath(destination):
-                    shutil.copyfile(path, destination)
-                if label == "MP3":
-                    current_mp3_path = destination
-                else:
-                    current_srt_path = destination
-                status_label.value = f"✅ {filename} ကို Downloads ထဲ သိမ်းပြီးပါပြီ။"
-                status_label.color = "#10B981"
-            elif source_abs.startswith(downloads_abs + os.sep):
-                destination = os.path.join(os.path.dirname(path), filename)
-                if source_abs != os.path.abspath(destination):
-                    shutil.move(path, destination)
-                if label == "MP3":
-                    current_mp3_path = destination
-                else:
-                    current_srt_path = destination
-                status_label.value = f"✅ {filename} အမည်ပြောင်းပြီးပါပြီ။"
-                status_label.color = "#10B981"
-            else:
-                status_label.value = (
-                    f"⚠️ {label} ကို app ထဲမှာ ထုတ်ပြီးပါပြီ၊ ဒါပေမဲ့ Android Downloads ခွင့်ပြုချက်မရှိပါ။ "
-                    "ဖိုင်အမည်ပြောင်းပြီး Downloads ထဲသိမ်းဖို့ Android storage permission လိုပါတယ်။"
-                )
-                status_label.color = "#F59E0B"
-        except Exception as ex:
-            status_label.value = f"❌ {label} သိမ်းမရပါ: {str(ex)[:100]}"
-            status_label.color = "#EF4444"
-        page.update()
-
-    async def share_mp3(e):
-        await save_output_file(current_mp3_path, "MP3", "mp3")
-
-    async def share_srt(e):
-        await save_output_file(current_srt_path, "SRT", "srt")
+    def share_srt(e):
+        if current_srt_path and os.path.exists(current_srt_path):
+            page.share_files([current_srt_path], text="Myanmar TTS Subtitle (SRT)")
 
     result_card = ft.Container(
         bgcolor=CARD_BG,
@@ -598,29 +507,8 @@ async def main(page: ft.Page):
 
     btn_text = ft.Text("🎙️ AUDIO + SRT စတင်ထုတ်မယ်", size=15, weight=ft.FontWeight.BOLD, color="#FFFFFF")
 
-    def on_audio_state_changed(e):
-        nonlocal is_playing, is_paused, playback_completed
-        state = str(getattr(e, "data", "") or getattr(e, "state", "")).lower()
-        if any(word in state for word in ("completed", "ended")):
-            is_playing = False
-            is_paused = False
-            playback_completed = True
-            play_btn.icon = ft.icons.PLAY_CIRCLE_FILL_ROUNDED
-            page.update()
-        elif "paused" in state:
-            is_playing = False
-            is_paused = True
-            play_btn.icon = ft.icons.PLAY_CIRCLE_FILL_ROUNDED
-            page.update()
-        elif "playing" in state:
-            is_playing = True
-            is_paused = False
-            playback_completed = False
-            play_btn.icon = ft.icons.PAUSE_CIRCLE_FILLED_ROUNDED
-            page.update()
-
     async def start_generation(e):
-        nonlocal current_mp3_path, current_srt_path, is_playing, is_paused, playback_completed, audio_player
+        nonlocal current_mp3_path, current_srt_path, is_playing, audio_player
         script = normalize_script(script_input.value)
         if not script:
             status_label.value = "⚠️ ကျေးဇူးပြု၍ Script စာသား အရင်ထည့်ပေးပါ။"
@@ -642,15 +530,11 @@ async def main(page: ft.Page):
         page.update()
 
         timestamp = int(time.time())
-        raw_name = (output_name_input.value or "myanmar_tts").strip()
-        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", raw_name).strip(" .")
-        safe_name = re.sub(r"\s+", "_", safe_name) or "myanmar_tts"
-        safe_name = re.sub(r"\.(mp3|srt)$", "", safe_name, flags=re.IGNORECASE).strip(" .") or "myanmar_tts"
         dl_dir = "/storage/emulated/0/Download"
         target_dir = dl_dir if (os.path.exists(dl_dir) and os.access(dl_dir, os.W_OK)) else OUTPUT_DIR
 
-        mp3_file = os.path.join(target_dir, f"{safe_name}_{timestamp}.mp3")
-        srt_file = os.path.join(target_dir, f"{safe_name}_{timestamp}.srt")
+        mp3_file = os.path.join(target_dir, f"mm_tts_{timestamp}.mp3")
+        srt_file = os.path.join(target_dir, f"mm_tts_{timestamp}.srt")
 
         async def update_prog(idx, total):
             progress_bar.value = (idx + 1) / total
@@ -673,34 +557,25 @@ async def main(page: ft.Page):
             current_mp3_path = mp3_file
             current_srt_path = srt_file
 
-            # Release the old player and replace it after both files exist.
+            # Create Audio only after a real MP3 source exists.
+            # This avoids the startup error about missing src/src_base64.
             if audio_player is not None:
                 try:
-                    await audio_player.release()
-                except Exception:
+                    page.overlay.remove(audio_player)
+                except (ValueError, AttributeError):
                     pass
-            detach_audio_player(audio_player)
-            audio_player = fta.Audio(
-                src=current_mp3_path,
-                autoplay=False,
-                on_state_change=on_audio_state_changed,
-            )
-            attach_audio_player(audio_player)
+
+            audio_player = ft.Audio(src=current_mp3_path, autoplay=False)
+            page.overlay.append(audio_player)
 
             play_btn.disabled = False
             play_btn.icon = ft.icons.PLAY_CIRCLE_FILL_ROUNDED
             is_playing = False
-            is_paused = False
-            playback_completed = False
 
             sec = round(duration_ms / 1000, 1)
             result_info.value = f"{selected_label} ({rate}) • {sec}s • {len(sub_texts)} SRT lines"
             result_card.visible = True
-            status_label.value = (
-                f"✅ ပြီးပါပြီ။ MP3 ({os.path.basename(mp3_file)}) နဲ့ "
-                f"SRT ({os.path.basename(srt_file)}) ထုတ်ပြီးပါပြီ။ "
-                "ဖိုင်အမည်ပြောင်းပြီး Downloads ထဲသိမ်းရန် အောက်က MP3 / SRT ခလုတ်ကိုနှိပ်ပါ။"
-            )
+            status_label.value = "✅ အောင်မြင်စွာ ထုတ်ပြီးပါပြီ!"
             status_label.color = "#10B981"
 
         except Exception as ex:
